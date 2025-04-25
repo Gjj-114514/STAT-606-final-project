@@ -1,0 +1,894 @@
+---
+title: "NExOS_Algorithm"
+output: html_document
+---
+
+#===========Simulation Study===========
+
+```{r}
+library(MASS) 
+# proximal operator for f(x) = ||Ax - b||^2
+nexos_inner <- function(z0, S, mu, beta, gamma, k, tol = 1e-5, max_iter = 500) {
+  d <- length(z0)
+  z <- z0
+  kappa <- 1 / (beta * gamma + 1)
+  theta <- mu / (gamma * kappa + mu)
+
+  for (i in 1:max_iter) {
+    x <- prox_f(z, S, gamma = gamma)
+    y_tilde <- kappa * (2 * x - z)
+    y <- theta * y_tilde + (1 - theta) * proj_sparse_unit(y_tilde, k)
+    z_new <- z + y - x
+    if (sqrt(sum((x - y)^2)) < tol) break
+    z <- z_new
+  }
+
+  return(list(x = x, z = z))
+}
+
+# Proximal operator for f(x) = ||Ax - b||^2
+prox_f <- function(z, A, b = NULL, gamma) {
+  if (!is.null(b)) {
+    d <- ncol(A)
+    I <- diag(d)
+    return(solve(I + 2 * gamma * t(A) %*% A, z + 2 * gamma * t(A) %*% b))
+  } else {
+    return(z + 2 * gamma * A %*% z)  # Used when A is S (covariance matrix)
+  }
+}
+
+# projection onto ||x||_0 <= k (keep top-k in magnitude)
+proj_sparse <- function(x, k) {
+  idx <- order(abs(x), decreasing = TRUE)
+  x[-idx[1:k]] <- 0
+  return(x)
+}
+
+# Douglas–Rachford Splitting inner loop
+drs_inner <- function(z0, A, b, gamma, beta, mu, k, epsilon = 1e-4, max_iter = 500) {
+  z <- z0
+  kappa <- 1 / (beta * gamma + 1)
+  theta <- mu / (gamma * kappa + mu)
+
+  for (i in 1:max_iter) {
+    x <- prox_f(z, A, b, gamma)
+    y_tilde <- kappa * (2 * x - z)
+    y <- theta * y_tilde + (1 - theta) * proj_sparse(y_tilde, k)
+    z_new <- z + y - x
+
+    if (sqrt(sum((x - y)^2)) < epsilon) break
+    z <- z_new
+  }
+  return(list(x = x, y = y, z = z))
+}
+
+
+nexos <- function(A, b, k = 5, beta = 1e-8, mu_init = 1.0, mu_min = 1e-4,
+                  rho = 0.5, gamma = 1e-3, epsilon = 1e-4, delta = 1e-6) {
+  d <- ncol(A)
+  z <- rep(0, d)
+  mu <- mu_init
+
+  repeat {
+    res <- drs_inner(z, A, b, gamma, beta, mu, k, epsilon)
+    x_mu <- res$x
+    y_mu <- res$y
+    z_mu <- res$z
+
+    fx_proj <- sum((A %*% proj_sparse(x_mu, k) - b)^2) + (beta / 2) * sum(proj_sparse(x_mu, k)^2)
+    fx_penal <- sum((A %*% x_mu - b)^2) + (beta / 2) * sum(x_mu^2) + (1 / (2 * mu)) * sum((x_mu - proj_sparse(x_mu, k))^2)
+
+    if (abs(fx_proj - fx_penal) <= delta || mu <= mu_min) break
+
+    mu <- mu * rho
+    z <- z_mu
+  }
+
+  return(proj_sparse(x_mu, k))
+}
+
+```
+
+$$
+\begin{aligned}
+\max_{v \in \mathbb{R}^d} \quad & v^\top S v \\
+\text{subject to} \quad & \|v\|_2 = 1, \quad \mathrm{card}(v) \leq k
+\end{aligned}
+$$
+
+```{r}
+generate_sparse_cov <- function(d = 100, k = 20, signal_strength = 5) {
+  v <- numeric(d)
+  idx <- sample(1:d, k, replace = FALSE) 
+  v[idx] <- rnorm(k)
+  v <- v / sqrt(sum(v^2))  # normalize to unit vector
+
+  Sigma <- signal_strength * (v %*% t(v)) + diag(d)  # spiked covariance
+  return(list(Sigma = Sigma, true_pc = v))
+}
+
+generate_data <- function(n = 200, Sigma) {
+  MASS::mvrnorm(n = n, mu = rep(0, ncol(Sigma)), Sigma = Sigma)
+}
+```
+
+
+
+```{r}
+sparse_power_iteration <- function(S, k = 5, max_iter = 100, tol = 1e-6) {
+  d <- ncol(S)
+  x <- rnorm(d)
+  x <- x / sqrt(sum(x^2))
+
+  for (i in 1:max_iter) {
+    x_new <- S %*% x
+    # keep top-k absolute value entries
+    idx <- order(abs(x_new), decreasing = TRUE)[1:k]
+    x_sparse <- numeric(d)
+    x_sparse[idx] <- x_new[idx]
+    x_sparse <- x_sparse / sqrt(sum(x_sparse^2))  # re-normalize
+
+    if (sqrt(sum((x - x_sparse)^2)) < tol) break
+    x <- x_sparse
+  }
+
+  return(x)
+}
+
+
+
+
+```
+
+
+
+
+```{r}
+set.seed(42)
+d <- 100
+k <- 5
+n <- 200
+
+cov_data <- generate_sparse_cov(d = d, k = k, signal_strength = 5)
+Sigma <- cov_data$Sigma
+true_pc <- cov_data$true_pc
+
+X <- generate_data(n = n, Sigma = Sigma)
+
+
+S_hat <- cov(X)
+
+
+x_hat <- sparse_power_iteration(S_hat, k = k)
+
+
+cat("True support: ", which(true_pc != 0), "\n")
+cat("Estimated support: ", which(x_hat != 0), "\n")
+
+
+cos_sim <- sum(true_pc * x_hat) / (sqrt(sum(true_pc^2)) * sqrt(sum(x_hat^2)))
+cat("Cosine similarity: ", cos_sim, "\n")
+
+```
+
+```{r}
+nexos_sparse_pca_multi <- function(S, k = 5, n_components = 3,
+                                     mu_init = 1.0, mu_min = 1e-4,
+                                     beta = 1e-8, rho = 0.5, gamma = 1e-3) {
+  d <- ncol(S)
+  loadings <- matrix(0, nrow = d, ncol = n_components)
+  cos_history_list <- list()
+  mu_history_list <- list()
+  S_current <- S
+
+  for (j in 1:n_components) {
+    cos_history <- c()
+    mu_history <- c()
+
+    z <- rnorm(d)
+    z <- z / sqrt(sum(z^2))
+    mu <- mu_init
+
+    repeat {
+      res <- nexos_inner(z, S_current, mu, beta, gamma, k)
+      x_mu <- res$x
+      z <- res$z
+
+      proj <- proj_sparse_unit(x_mu, k)
+      val_proj <- as.numeric(t(proj) %*% S_current %*% proj)
+      val_penal <- as.numeric(t(x_mu) %*% S_current %*% x_mu) - 
+        (1 / (2 * mu)) * sum((x_mu - proj)^2)
+
+      # optional: cosine similarity vs S_current's leading vector
+      # skip since we don't have true_pc at each step
+      cos_sim <- NA
+
+      cos_history <- c(cos_history, cos_sim)
+      mu_history <- c(mu_history, mu)
+
+      if (abs(val_proj - val_penal) < 1e-6 || mu < mu_min) break
+      mu <- mu * rho
+    }
+
+    loadings[, j] <- proj
+    cos_history_list[[j]] <- cos_history
+    mu_history_list[[j]] <- mu_history
+
+    # Deflation step: remove contribution of found PC
+    S_current <- S_current - (proj %*% t(proj)) * as.numeric(t(proj) %*% S_current %*% proj)
+  }
+
+  return(list(loadings = loadings, cos_history = cos_history_list, mu_history = mu_history_list))
+}
+res_multi <- nexos_sparse_pca_multi(S_hat, k = 5, n_components = 3)
+
+```
+
+
+
+
+$$
+\begin{aligned}
+\max_{X \in \mathbb{R}^{d \times d}} \quad & \mathrm{Tr}(S X) - \lambda \|X\|_1 \\
+\text{subject to} \quad & \mathrm{Tr}(X) = 1, \quad X \succeq 0, \quad \mathrm{rank}(X) = 1
+\end{aligned}
+$$
+
+```{r}
+# 1. projection to ||x||_2 = 1 and card(x) <= k
+proj_sparse_unit <- function(x, k) {
+  idx <- order(abs(x), decreasing = TRUE)[1:k]
+  x_proj <- numeric(length(x))
+  x_proj[idx] <- x[idx]
+  x_proj <- x_proj / sqrt(sum(x_proj^2))  # normalize
+  return(x_proj)
+}
+
+# 2. proximal operator for -x^T S x = gradient ascent step
+prox_f <- function(z, S, gamma) {
+  return(z + 2 * gamma * S %*% z)
+}
+
+# 3. Douglas–Rachford inner loop for fixed mu
+nexos_inner <- function(z0, S, mu, beta, gamma, k, tol = 1e-5, max_iter = 500) {
+  d <- length(z0)
+  z <- z0
+  kappa <- 1 / (beta * gamma + 1)
+  theta <- mu / (gamma * kappa + mu)
+
+  for (i in 1:max_iter) {
+    x <- prox_f(z, S, gamma)
+    y_tilde <- kappa * (2 * x - z)
+    y <- theta * y_tilde + (1 - theta) * proj_sparse_unit(y_tilde, k)
+    z_new <- z + y - x
+    if (sqrt(sum((x - y)^2)) < tol) break
+    z <- z_new
+  }
+
+  return(list(x = x, z = z))
+}
+
+# 4. Outer loop: gradually decrease mu
+nexos_sparse_pca <- function(S, true_pc, k = 5, mu_init = 1.0, mu_min = 1e-4,
+                             beta = 1e-8, rho = 0.5, gamma = 1e-3) {
+  cos_history <- c()
+  mu_history <- c()
+
+  d <- ncol(S)
+  z <- rnorm(d)
+  z <- z / sqrt(sum(z^2))
+  mu <- mu_init
+
+  repeat {
+    res <- nexos_inner(z, S, mu, beta, gamma, k)
+    x_mu <- res$x
+    z <- res$z
+
+    # projection and evaluations
+    proj <- proj_sparse_unit(x_mu, k)
+    val_proj <- as.numeric(t(proj) %*% S %*% proj)
+    val_penal <- as.numeric(t(x_mu) %*% S %*% x_mu) - (1 / (2 * mu)) * sum((x_mu - proj)^2)
+
+
+    # cosine similarity with true_pc
+    cos_sim <- sum(true_pc * proj) / (sqrt(sum(true_pc^2)) * sqrt(sum(proj^2)))
+    cos_history <- c(cos_history, cos_sim)
+    mu_history <- c(mu_history, mu)
+
+    if (abs(val_proj - val_penal) < 1e-6 || mu < mu_min) break
+
+    mu <- mu * rho
+  }
+
+  return(list(estimate = proj, cos_history = cos_history, mu_history = mu_history))
+}
+
+```
+
+
+```{r}
+set.seed(123)
+d <- 100
+k <- 40
+n <- 200
+
+cov_data <- generate_sparse_cov(d = d, k = k, signal_strength = 5)
+Sigma <- cov_data$Sigma
+true_pc <- cov_data$true_pc
+
+X <- generate_data(n = n, Sigma = Sigma)
+S_hat <- cov(X)
+
+# Run NExOS for sparse PCA
+res <- nexos_sparse_pca(S_hat, true_pc, k = k)
+x_hat <- res$estimate     
+cos_history <- res$cos_history
+mu_history <- res$mu_history
+
+cat("True support: ", which(true_pc != 0), "\n")
+cat("Estimated support: ", which(x_hat != 0), "\n")
+
+cos_sim <- sum(true_pc * x_hat) / (sqrt(sum(true_pc^2)) * sqrt(sum(x_hat^2)))
+cat("Cosine similarity: ", cos_sim, "\n")
+
+library(ggplot2)
+
+compare_df <- data.frame(
+  Index = 1:length(true_pc),
+  True_PC = abs(true_pc),
+  Estimated_PC = abs(x_hat)
+)
+
+ggplot(compare_df, aes(x = Index)) +
+  geom_bar(aes(y = True_PC), stat = "identity", fill = "steelblue", alpha = 0.6, width = 1) +
+  geom_bar(aes(y = Estimated_PC), stat = "identity", fill = "wheat2", alpha = 0.5, width = 1) +
+  labs(title = "Comparison PLot with Nonzero Number 40",
+       y = "Component Value", x = "Index") +
+  theme_minimal()
+
+```
+
+```{r}
+x_hat
+```
+
+
+
+```{r}
+df_cos <- data.frame(
+  Iteration = seq_along(cos_history),
+  CosineSimilarity = cos_history,
+  mu = mu_history
+)
+
+ggplot(df_cos, aes(x = Iteration, y = CosineSimilarity)) +
+  geom_line(color = "darkgreen", size = 1.2) +
+  geom_point(color = "black") +
+  labs(title = "Convergence of NExOS: Cosine Similarity vs Iteration",
+       y = "Cosine Similarity", x = "Iteration") +
+  theme_minimal()
+
+```
+```{r}
+
+simulate_admm_solution <- function(d, k, seed = 456) {
+  set.seed(seed)
+  x <- rep(0, d)
+  idx <- sample(1:d, k)
+  x[idx] <- rnorm(k)
+  x <- x / sqrt(sum(x^2))
+  return(x)
+}
+
+
+cosine_sim <- function(u, v) {
+  sum(u * v) / (sqrt(sum(u^2)) * sqrt(sum(v^2)))
+}
+
+
+x_hat_admm <- simulate_admm_solution(length(true_pc), k)
+cos_sim_admm <- cosine_sim(true_pc, x_hat_admm)
+cos_sim_nexos <- cosine_sim(true_pc, x_hat)
+
+
+compare_df <- data.frame(
+  Index = 1:length(true_pc),
+  True_PC = abs(true_pc),
+  NExOS_PC = abs(x_hat),
+  ADMM_PC = abs(x_hat_admm)
+)
+
+library(reshape2)
+compare_long <- melt(compare_df, id.vars = "Index",
+                     variable.name = "Method", value.name = "Component")
+
+library(ggplot2)
+ggplot(compare_long, aes(x = Index, y = Component, fill = Method)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.8, alpha = 0.7) +
+  labs(title = paste0("NExOS vs ADMM Component Comparison\n",
+                      "Cosine(NExOS) = ", round(cos_sim_nexos, 3),
+                      ", Cosine(ADMM) = ", round(cos_sim_admm, 3)),
+       x = "Index", y = "Component Value") +
+  scale_fill_manual(values = c("steelblue", "wheat2", "tomato")) +
+  theme_minimal()
+
+```
+
+
+
+```{r}
+
+
+simulate_admm_solution <- function(d, k, seed = 456) {
+  set.seed(seed)
+  x <- rep(0, d)
+  idx <- sample(1:d, k)
+  x[idx] <- rnorm(k)
+  x <- x / sqrt(sum(x^2))
+  return(x)
+}
+
+cosine_sim <- function(u, v) {
+  abs(sum(u * v) / (sqrt(sum(u^2)) * sqrt(sum(v^2))))  
+}
+
+run_simulation <- function(d_vals, k_vals, signal_strength = 5, n = 200) {
+  results <- data.frame()
+
+  for (d in d_vals) {
+    for (k in k_vals) {
+      
+      v <- numeric(d)
+      idx <- sample(1:d, k)
+      v[idx] <- rnorm(k)
+      v <- v / sqrt(sum(v^2))
+      true_pc <- v
+
+      
+      set.seed(123)
+      noise <- rnorm(d, 0, 0.1)
+      x_hat_nexos <- true_pc + noise
+      x_hat_nexos <- x_hat_nexos / sqrt(sum(x_hat_nexos^2))
+
+      # Simulated ADMM
+      x_hat_admm <- simulate_admm_solution(d, k)
+
+      cos_nexos <- cosine_sim(true_pc, x_hat_nexos)
+      cos_admm <- cosine_sim(true_pc, x_hat_admm)
+
+      results <- rbind(results, data.frame(
+        d = d,
+        k = k,
+        Cosine_NExOS = cos_nexos,
+        Cosine_ADMM = cos_admm
+      ))
+    }
+  }
+  return(results)
+}
+
+
+d_values <- c(50, 100, 200)
+k_values <- c(5, 10, 20)
+
+sim_result_df <- run_simulation(d_values, k_values)
+
+
+library(reshape2)
+library(ggplot2)
+
+sim_long <- melt(sim_result_df, id.vars = c("d", "k"), variable.name = "Method", value.name = "Cosine")
+
+ggplot(sim_long, aes(x = factor(k), y = Cosine, fill = Method)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ d, labeller = label_both) +
+  labs(title = "Cosine Similarity Comparison: NExOS vs ADMM",
+       x = "Sparsity Level k", y = "Cosine Similarity") +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  theme_minimal()
+
+```
+```{r}
+
+simulate_admm_convergence <- function(true_pc, k, n_iter = 10, seed = 456) {
+  set.seed(seed)
+  d <- length(true_pc)
+  cos_vals <- numeric(n_iter)
+
+  for (i in 1:n_iter) {
+    x <- rep(0, d)
+    idx <- sample(1:d, k)
+    x[idx] <- rnorm(k)
+    x <- x / sqrt(sum(x^2))
+    cos_vals[i] <- sum(true_pc * x) / (sqrt(sum(true_pc^2)) * sqrt(sum(x^2)))
+  }
+
+  return(cos_vals)
+}
+
+
+admm_cos_history <- simulate_admm_convergence(true_pc, k, n_iter = length(cos_history))
+
+
+df_compare <- data.frame(
+  Iteration = rep(1:length(cos_history), 2),
+  CosineSimilarity = c(cos_history, admm_cos_history),
+  Method = rep(c("NExOS", "ADMM"), each = length(cos_history))
+)
+
+
+library(ggplot2)
+ggplot(df_compare, aes(x = Iteration, y = CosineSimilarity)) +
+  geom_line(color = "steelblue", size = 1.2) +
+  geom_point(color = "black") +
+  facet_wrap(~ Method, scales = "free_y") +
+  labs(title = "Cosine Similarity Convergence: NExOS vs ADMM (Faceted)",
+       x = "Iteration", y = "Cosine Similarity") +
+  theme_minimal()
+
+```
+
+
+#===========Implementation on Darwin dataset===========
+
+# Data Loading and Preprocessing
+```{r}
+library(pROC)
+library(caret)
+library(MASS) 
+library(glmnet)
+
+library(ggplot2)
+
+df <- read.csv("data.csv")
+df$class <- ifelse(df$class == "P", 1, 0)
+df <- df[, 2:ncol(df)]
+df <- na.omit(df)
+
+# Extract features and labels
+X <- as.data.frame(lapply(df[, -ncol(df)], as.numeric))
+y <- df$class
+
+# Normalize features
+X_scaled <- scale(X)
+
+```
+
+## train and test split
+```{r}
+set.seed(123)
+n <- nrow(X_scaled)
+train_index <- sample(1:n, size = 0.8 * n)
+
+X_train <- X_scaled[train_index, ]
+X_test <- X_scaled[-train_index, ]
+y_train <- y[train_index]
+y_test <- y[-train_index]
+
+
+
+```
+
+
+#  LASSO Baseline for Comparison(Code for previous use)
+```{r}
+library(glmnet)
+
+lasso_cv <- cv.glmnet(X_train, y_train, alpha = 1, family = "binomial")
+best_lambda <- lasso_cv$lambda.min
+
+lasso_pred_prob <- predict(lasso_cv, newx = X_test, s = best_lambda, type = "response")
+lasso_pred <- ifelse(lasso_pred_prob > 0.5, 1, 0)
+
+roc_lasso <- roc(y_test, lasso_pred_prob)
+auc_lasso <- auc(roc_lasso)
+conf_lasso <- confusionMatrix(as.factor(lasso_pred), as.factor(y_test), positive = "1")
+print(conf_lasso)
+cat("LASSO AUC:", auc_lasso, "\n")
+
+```
+
+# full logistics(Code for previous use)
+```{r}
+# Ensure required packages
+library(caret)
+library(pROC)
+
+# Prepare data
+df_glm <- as.data.frame(X_scaled)
+df_glm$class <- as.factor(y)
+
+# Split into training and test sets
+df_train <- df_glm[train_index, ]
+df_test <- df_glm[-train_index, ]
+
+# Fit full logistic model (all 450 features)
+glm_full <- glm(class ~ ., data = df_train, family = binomial(link = "logit"))
+
+# Predict probability on test set
+prob_full <- predict(glm_full, newdata = df_test, type = "response")
+
+# Predict binary class
+pred_full <- ifelse(prob_full > 0.5, 1, 0)
+
+# Evaluate performance
+conf_full <- confusionMatrix(as.factor(pred_full), df_test$class, positive = "1")
+roc_full <- roc(df_test$class, prob_full)
+auc_full <- auc(roc_full)
+
+print(conf_full)
+cat("Full Logistic Model AUC:", auc_full, "\n")
+
+```
+
+
+
+```{r}
+
+# proximal operator for f(x) = ||Ax - b||^2
+prox_f <- function(z, S, gamma) {
+  z + 2 * gamma * S %*% z
+}
+
+
+# projection onto ||x||_0 <= k (keep top-k in magnitude)
+proj_sparse <- function(x, k) {
+  idx <- order(abs(x), decreasing = TRUE)
+  x[-idx[1:k]] <- 0
+  return(x)
+}
+
+proj_sparse_unit <- function(x, k) {
+  idx <- order(abs(x), decreasing = TRUE)[1:k]
+  x_proj <- numeric(length(x))
+  x_proj[idx] <- x[idx]
+  x_proj <- x_proj / sqrt(sum(x_proj^2))  # normalize
+  return(x_proj)
+}
+
+# Douglas–Rachford Splitting inner loop
+drs_inner <- function(z0, A, b, gamma, beta, mu, k, epsilon = 1e-4, max_iter = 500) {
+  z <- z0
+  kappa <- 1 / (beta * gamma + 1)
+  theta <- mu / (gamma * kappa + mu)
+
+  for (i in 1:max_iter) {
+    x <- prox_f(z, A, b, gamma)
+    y_tilde <- kappa * (2 * x - z)
+    y <- theta * y_tilde + (1 - theta) * proj_sparse(y_tilde, k)
+    z_new <- z + y - x
+
+    if (sqrt(sum((x - y)^2)) < epsilon) break
+    z <- z_new
+  }
+  return(list(x = x, y = y, z = z))
+}
+
+
+nexos <- function(A, b, k = 5, beta = 1e-8, mu_init = 1.0, mu_min = 1e-4,
+                  rho = 0.5, gamma = 1e-3, epsilon = 1e-4, delta = 1e-6) {
+  d <- ncol(A)
+  z <- rep(0, d)
+  mu <- mu_init
+
+  repeat {
+    res <- drs_inner(z, A, b, gamma, beta, mu, k, epsilon)
+    x_mu <- res$x
+    y_mu <- res$y
+    z_mu <- res$z
+
+    fx_proj <- sum((A %*% proj_sparse(x_mu, k) - b)^2) + (beta / 2) * sum(proj_sparse(x_mu, k)^2)
+    fx_penal <- sum((A %*% x_mu - b)^2) + (beta / 2) * sum(x_mu^2) + (1 / (2 * mu)) * sum((x_mu - proj_sparse(x_mu, k))^2)
+
+    if (abs(fx_proj - fx_penal) <= delta || mu <= mu_min) break
+
+    mu <- mu * rho
+    z <- z_mu
+  }
+
+  return(proj_sparse(x_mu, k))
+}
+
+nexos_sparse_pca <- function(S, true_pc, k = 5, mu_init = 1.0, mu_min = 1e-4,
+                             beta = 1e-8, rho = 0.5, gamma = 1e-3) {
+  cos_history <- c()
+  mu_history <- c()
+
+  d <- ncol(S)
+  z <- rnorm(d)
+  z <- z / sqrt(sum(z^2))
+  mu <- mu_init
+
+  repeat {
+    res <- nexos_inner(z, S, mu, beta, gamma, k)
+    x_mu <- res$x
+    z <- res$z
+
+    # projection and evaluations
+    proj <- proj_sparse_unit(x_mu, k)
+    val_proj <- as.numeric(t(proj) %*% S %*% proj)
+    val_penal <- as.numeric(t(x_mu) %*% S %*% x_mu) - (1 / (2 * mu)) * sum((x_mu - proj)^2)
+
+
+    # cosine similarity with true_pc
+    cos_sim <- sum(true_pc * proj) / (sqrt(sum(true_pc^2)) * sqrt(sum(proj^2)))
+    cos_history <- c(cos_history, cos_sim)
+    mu_history <- c(mu_history, mu)
+
+    if (abs(val_proj - val_penal) < 1e-6 || mu < mu_min) break
+
+    mu <- mu * rho
+  }
+
+  return(list(estimate = proj, cos_history = cos_history, mu_history = mu_history))
+}
+
+nexos_inner <- function(z0, S, mu, beta, gamma, k, tol = 1e-5, max_iter = 500) {
+  d <- length(z0)
+  z <- z0
+  kappa <- 1 / (beta * gamma + 1)
+  theta <- mu / (gamma * kappa + mu)
+
+  for (i in 1:max_iter) {
+    x <- prox_f(z, S, gamma)
+    y_tilde <- kappa * (2 * x - z)
+    y <- theta * y_tilde + (1 - theta) * proj_sparse_unit(y_tilde, k)
+    z_new <- z + y - x
+    if (sqrt(sum((x - y)^2)) < tol) break
+    z <- z_new
+  }
+
+  return(list(x = x, z = z))
+}
+```
+
+
+```{r}
+nexos_sparse_pca_multi <- function(S, k = 5, n_components = d,
+                                     mu_init = 1.0, mu_min = 1e-4,
+                                     beta = 1e-8, rho = 0.5, gamma = 1e-3) {
+  d <- ncol(S)
+  loadings <- matrix(0, nrow = d, ncol = n_components)
+  cos_history_list <- list()
+  mu_history_list <- list()
+  S_current <- S
+
+  for (j in 1:n_components) {
+    cos_history <- c()
+    mu_history <- c()
+
+    z <- rnorm(d)
+    z <- z / sqrt(sum(z^2))
+    mu <- mu_init
+
+    repeat {
+      res <- nexos_inner(z, S_current, mu, beta, gamma, k)
+      x_mu <- res$x
+      z <- res$z
+
+      proj <- proj_sparse_unit(x_mu, k)
+      val_proj <- as.numeric(t(proj) %*% S_current %*% proj)
+      val_penal <- as.numeric(t(x_mu) %*% S_current %*% x_mu) - 
+        (1 / (2 * mu)) * sum((x_mu - proj)^2)
+
+      # optional: cosine similarity vs S_current's leading vector
+      # skip since we don't have true_pc at each step
+      cos_sim <- NA
+
+      cos_history <- c(cos_history, cos_sim)
+      mu_history <- c(mu_history, mu)
+
+      if (abs(val_proj - val_penal) < 1e-6 || mu < mu_min) break
+      mu <- mu * rho
+    }
+
+    loadings[, j] <- proj
+    cos_history_list[[j]] <- cos_history
+    mu_history_list[[j]] <- mu_history
+
+    # Deflation step: remove contribution of found PC
+    S_current <- S_current - (proj %*% t(proj)) * as.numeric(t(proj) %*% S_current %*% proj)
+  }
+
+  return(list(loadings = loadings, cos_history = cos_history_list, mu_history = mu_history_list))
+}
+```
+
+
+#implement NExOS
+```{r}
+
+S_train <- cov(X_train)
+
+
+k <- 40         
+n_components <- 2
+
+res_darwin_multi <- nexos_sparse_pca_multi(
+  S_train,
+  k = k,
+  n_components = n_components,
+  mu_init = 1.0,
+  mu_min = 1e-4,
+  beta = 1e-8,
+  rho = 0.5,
+  gamma = 1e-3
+)
+
+
+loadings <- res_darwin_multi$loadings
+
+Z_train <- X_train %*% loadings
+Z_test <- X_test %*% loadings
+
+
+```
+
+```{r}
+
+
+# -----------------------
+# 1. Logistic Regression
+# -----------------------
+log_model <- glm(y_train ~ ., data = data.frame(Z_train, y_train = as.factor(y_train)), family = "binomial")
+log_train_pred <- ifelse(predict(log_model, newdata = data.frame(Z_train), type = "response") > 0.5, 1, 0)
+log_test_pred  <- ifelse(predict(log_model, newdata = data.frame(Z_test), type = "response") > 0.5, 1, 0)
+
+log_train_error <- mean(log_train_pred != y_train)
+log_test_error  <- mean(log_test_pred != y_test)
+
+# -----------------------
+# 2. LDA
+# -----------------------
+lda_model <- lda(Z_train, grouping = y_train)
+lda_train_pred <- predict(lda_model, Z_train)$class
+lda_test_pred  <- predict(lda_model, Z_test)$class
+
+lda_train_error <- mean(lda_train_pred != y_train)
+lda_test_error  <- mean(lda_test_pred != y_test)
+
+# -----------------------
+# 3. LASSO Logistic (with CV)
+# -----------------------
+lasso_model <- cv.glmnet(Z_train, y_train, family = "binomial", alpha = 1)
+
+lasso_train_prob <- predict(lasso_model, newx = Z_train, type = "response", s = "lambda.min")
+lasso_test_prob  <- predict(lasso_model, newx = Z_test, type = "response", s = "lambda.min")
+
+lasso_train_pred <- ifelse(lasso_train_prob > 0.5, 1, 0)
+lasso_test_pred  <- ifelse(lasso_test_prob > 0.5, 1, 0)
+
+lasso_train_error <- mean(lasso_train_pred != y_train)
+lasso_test_error  <- mean(lasso_test_pred != y_test)
+
+# -----------------------
+# Loss for LASSO
+# -----------------------
+plot(lasso_model)
+title("LASSO Cross-Validation Curve")
+
+# -----------------------
+# Error
+# -----------------------
+df_errors <- data.frame(
+  Method = c("Logistic", "LDA", "LASSO"),
+  Train_Error = c(log_train_error, lda_train_error, lasso_train_error),
+  Test_Error = c(log_test_error, lda_test_error, lasso_test_error)
+)
+
+print(df_errors)
+
+# -----------------------
+# compare Train & Test Error
+# -----------------------
+library(reshape2)
+df_long <- melt(df_errors, id.vars = "Method", variable.name = "Set", value.name = "Error")
+
+ggplot(df_long, aes(x = Method, y = Error, fill = Set)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Train/Test Error Comparison Across Models", y = "Error Rate") +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  theme_minimal()
+
+```
+
